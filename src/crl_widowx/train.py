@@ -112,6 +112,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-width", type=int, default=640)
     parser.add_argument("--render-height", type=int, default=480)
     parser.add_argument("--camera-name", type=str, default="isometric", choices=["isometric", "topdown"])
+    parser.add_argument("--observation-mode", type=str, default="state", choices=["state", "image"])
+    parser.add_argument("--image-observation-width", type=int, default=64)
+    parser.add_argument("--image-observation-height", type=int, default=64)
+    parser.add_argument("--image-observation-grayscale", action="store_true", default=False)
     parser.add_argument("--max-gpu-mode", action="store_true", default=False)
 
     parser.add_argument("--action-scale-arm", type=float, default=0.08)
@@ -164,7 +168,8 @@ def collect_episode(
 
     episode_return = 0.0
     success = float(info.get("is_success", 0.0))
-    reach_distances = [float(np.linalg.norm(obs["observation"][-4:-1]))]
+    state_obs = obs.get("state", obs["observation"])
+    reach_distances = [float(np.linalg.norm(state_obs[-4:-1]))]
     cube_goal_distances = [
         float(np.linalg.norm(obs["achieved_goal"][:2] - obs["desired_goal"][:2]))
     ]
@@ -208,7 +213,8 @@ def collect_episode(
 
         episode_return += float(reward)
         success = max(success, float(info.get("is_success", 0.0)))
-        reach_distances.append(float(np.linalg.norm(next_obs["observation"][-4:-1])))
+        next_state_obs = next_obs.get("state", next_obs["observation"])
+        reach_distances.append(float(np.linalg.norm(next_state_obs[-4:-1])))
         cube_goal_distances.append(float(np.linalg.norm(next_obs["achieved_goal"][:2] - next_obs["desired_goal"][:2])))
         attached_steps += int(float(info.get("reward_attach_term", 0.0)) > 0.0)
 
@@ -417,10 +423,15 @@ def main() -> None:
         render_width=args.render_width,
         render_height=args.render_height,
         camera_name=args.camera_name,
+        observation_mode=args.observation_mode,
+        image_observation_width=args.image_observation_width,
+        image_observation_height=args.image_observation_height,
+        image_observation_grayscale=args.image_observation_grayscale,
         seed=args.seed,
     )
 
-    env = WidowXPickPlaceEnv(env_cfg, render_mode=None)
+    train_render_mode = "rgb_array" if args.observation_mode == "image" else None
+    env = WidowXPickPlaceEnv(env_cfg, render_mode=train_render_mode)
     eval_env = WidowXPickPlaceEnv(env_cfg, render_mode="rgb_array")
 
     first_obs, _ = env.reset(seed=args.seed)

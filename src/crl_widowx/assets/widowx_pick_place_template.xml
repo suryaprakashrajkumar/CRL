@@ -23,8 +23,8 @@
 
     <geom name="ground" type="plane" size="1.5 1.5 0.05" material="ground_mat" />
 
-    <camera name="isometric" pos="0.58 0.32 0.55"
-      xyaxes="-0.531 0.847 0.000 -0.434 -0.272 0.859" fovy="40" />
+    <camera name="isometric" pos="0.62 -0.34 0.58"
+      xyaxes="0.667 0.745 0.000 -0.522 0.467 0.714" fovy="42" />
     <camera name="topdown" pos="0.24 0.0 0.95" xyaxes="1 0 0 0 1 0" fovy="32" />
 
     <body name="table" pos="0.24 0 0.02">

@@ -41,6 +41,10 @@ class WidowXEnvConfig:
     render_width: int = 640
     render_height: int = 480
     camera_name: str = "isometric"
+    observation_mode: str = "state"
+    image_observation_width: int = 64
+    image_observation_height: int = 64
+    image_observation_grayscale: bool = False
     seed: int = 0
 
 
@@ -119,12 +123,17 @@ class WidowXPickPlaceEnv(gym.Env):
         self.model.site_size[self._red_site_id] = zone_size
         self.model.site_size[self._blue_site_id] = zone_size
 
+        if self.config.observation_mode not in {"state", "image"}:
+            raise ValueError("observation_mode must be 'state' or 'image'.")
+
         obs, _ = self.reset(seed=config.seed)
         observation_dim = int(obs["observation"].shape[0])
+        state_dim = int(obs["state"].shape[0])
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
         self.observation_space = spaces.Dict(
             {
                 "observation": spaces.Box(low=-np.inf, high=np.inf, shape=(observation_dim,), dtype=np.float32),
+                "state": spaces.Box(low=-np.inf, high=np.inf, shape=(state_dim,), dtype=np.float32),
                 "achieved_goal": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
                 "desired_goal": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             }
@@ -198,7 +207,7 @@ class WidowXPickPlaceEnv(gym.Env):
         self.model.site_pos[self._red_site_id] = np.array([self._source_center[0], self._source_center[1], 0.041], dtype=np.float64)
         self.model.site_pos[self._blue_site_id] = np.array([target_center_xy[0], target_center_xy[1], 0.041], dtype=np.float64)
 
-    def _get_obs(self) -> dict[str, np.ndarray]:
+    def _get_state_obs(self) -> np.ndarray:
         qpos = self.data.qpos[self._qpos_ids].astype(np.float32)
         qvel = self.data.qvel[self._qvel_ids].astype(np.float32)
 
@@ -208,7 +217,7 @@ class WidowXPickPlaceEnv(gym.Env):
         cube_to_ee = (cube_pos - ee_pos).astype(np.float32)
         grip_opening = np.array([qpos[6] - qpos[7]], dtype=np.float32)
 
-        state = np.concatenate(
+        return np.concatenate(
             [
                 qpos,
                 qvel,
@@ -220,8 +229,33 @@ class WidowXPickPlaceEnv(gym.Env):
             axis=0,
         ).astype(np.float32)
 
+    def _resize_frame_nearest(self, frame: np.ndarray) -> np.ndarray:
+        target_h = int(self.config.image_observation_height)
+        target_w = int(self.config.image_observation_width)
+        src_h, src_w = frame.shape[:2]
+        y_idx = np.linspace(0, src_h - 1, target_h).astype(np.int32)
+        x_idx = np.linspace(0, src_w - 1, target_w).astype(np.int32)
+        return frame[y_idx][:, x_idx]
+
+    def _get_image_obs(self) -> np.ndarray:
+        frame = self._render_rgb_frame(require=True)
+        small = self._resize_frame_nearest(frame).astype(np.float32) / 255.0
+        if self.config.image_observation_grayscale:
+            small = (
+                0.299 * small[..., 0]
+                + 0.587 * small[..., 1]
+                + 0.114 * small[..., 2]
+            )[..., None]
+        return np.transpose(small, (2, 0, 1)).reshape(-1).astype(np.float32)
+
+    def _get_obs(self) -> dict[str, np.ndarray]:
+        state = self._get_state_obs()
+        observation = state if self.config.observation_mode == "state" else self._get_image_obs()
+        cube_pos = self.data.xpos[self._cube_body_id].astype(np.float32)
+
         return {
-            "observation": state,
+            "observation": observation.astype(np.float32),
+            "state": state.astype(np.float32),
             "achieved_goal": cube_pos.astype(np.float32),
             "desired_goal": self._desired_goal.astype(np.float32),
         }
@@ -445,11 +479,10 @@ class WidowXPickPlaceEnv(gym.Env):
         }
         return obs, reward, terminated, truncated, info
 
-    def render(self):
-        if self.render_mode != "rgb_array":
-            return None
-
+    def _render_rgb_frame(self, require: bool = False) -> np.ndarray | None:
         if self._render_failed:
+            if require:
+                raise RuntimeError("Rendering is unavailable after a previous renderer failure.")
             return None
 
         # Avoid known noisy GLFW failures on headless nodes without explicit MUJOCO_GL backend.
@@ -468,6 +501,8 @@ class WidowXPickPlaceEnv(gym.Env):
                     print(f"Warning: render disabled ({reason}, MUJOCO_GL not set).")
                     self._render_error_logged = True
                 self._render_failed = True
+                if require:
+                    raise RuntimeError("MUJOCO_GL or a valid DISPLAY is required for image observations.")
                 return None
 
         try:
@@ -489,7 +524,15 @@ class WidowXPickPlaceEnv(gym.Env):
                 except Exception:
                     pass
                 self._renderer = None
+            if require:
+                raise RuntimeError(f"Renderer failed while building image observation: {exc}") from exc
             return None
+
+    def render(self):
+        if self.render_mode != "rgb_array":
+            return None
+
+        return self._render_rgb_frame(require=False)
 
     def close(self):
         if self._renderer is not None:
