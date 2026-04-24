@@ -49,7 +49,7 @@ CMD=(
   --energy-fn dot
   --reward-loss-coeff 0.0
   --actor-reward-bonus-coeff 0.0
-  --actor-awbc-coeff 0.0
+  --actor-awbc-coeff 0.05
   --actor-awbc-temp 0.35
 
   --action-scale-arm 0.12

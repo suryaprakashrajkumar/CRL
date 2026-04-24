@@ -438,6 +438,10 @@ def main() -> None:
     obs_dim = int(first_obs["observation"].shape[0])
     goal_dim = int(first_obs["desired_goal"].shape[0])
     action_dim = int(env.action_space.shape[0])
+    obs_shape = None
+    if args.observation_mode == "image":
+        obs_channels = 1 if args.image_observation_grayscale else 3
+        obs_shape = (obs_channels, args.image_observation_height, args.image_observation_width)
 
     agent_cfg = CRLConfig(
         obs_dim=obs_dim,
@@ -459,6 +463,7 @@ def main() -> None:
         target_entropy_scale=args.target_entropy_scale,
         min_log_alpha=args.min_log_alpha,
         max_log_alpha=args.max_log_alpha,
+        obs_shape=obs_shape,
         device=args.device,
     )
     agent = CRLAgent(agent_cfg)

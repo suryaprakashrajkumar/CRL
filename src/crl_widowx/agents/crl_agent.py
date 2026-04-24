@@ -38,6 +38,7 @@ class CRLConfig:
     min_log_alpha: float = -4.0
     max_log_alpha: float = 2.0
     normalize_repr: bool = True
+    obs_shape: tuple[int, int, int] | None = None
     device: str = "cpu"
 
 
@@ -58,11 +59,62 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class Actor(nn.Module):
-    def __init__(self, obs_dim: int, goal_dim: int, action_dim: int, hidden_dim: int) -> None:
+class ObservationEncoder(nn.Module):
+    def __init__(self, obs_dim: int, hidden_dim: int, obs_shape: tuple[int, int, int] | None = None) -> None:
         super().__init__()
+        self.obs_shape = obs_shape
+        if obs_shape is None:
+            self.encoder = nn.Sequential(
+                nn.Linear(obs_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+            )
+            self.output_dim = hidden_dim
+            return
+
+        channels, height, width = obs_shape
+        if obs_dim != channels * height * width:
+            raise ValueError(f"obs_dim={obs_dim} does not match obs_shape={obs_shape}.")
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, 16, kernel_size=5, stride=2, padding=2),
+            nn.SiLU(),
+            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, channels, height, width)
+            conv_dim = int(self.conv(dummy).shape[-1])
+        self.proj = nn.Sequential(
+            nn.Linear(conv_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+        self.output_dim = hidden_dim
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.obs_shape is None:
+            return self.encoder(obs)
+        batch = obs.shape[0]
+        x = obs.reshape(batch, *self.obs_shape)
+        return self.proj(self.conv(x))
+
+
+class Actor(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        goal_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        obs_shape: tuple[int, int, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.obs_encoder = ObservationEncoder(obs_dim, hidden_dim, obs_shape)
         self.trunk = nn.Sequential(
-            nn.Linear(obs_dim + goal_dim, hidden_dim),
+            nn.Linear(self.obs_encoder.output_dim + goal_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -73,7 +125,8 @@ class Actor(nn.Module):
         self.log_std_head = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, states: torch.Tensor, goals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = torch.cat([states, goals], dim=-1)
+        obs_features = self.obs_encoder(states)
+        x = torch.cat([obs_features, goals], dim=-1)
         h = self.trunk(x)
         mean = self.mean_head(h)
 
@@ -97,15 +150,79 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 
+class StateActionEncoder(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        repr_dim: int,
+        obs_shape: tuple[int, int, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.obs_encoder = ObservationEncoder(obs_dim, hidden_dim, obs_shape)
+        self.net = nn.Sequential(
+            nn.Linear(self.obs_encoder.output_dim + action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, repr_dim),
+        )
+
+    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        obs_features = self.obs_encoder(states)
+        return self.net(torch.cat([obs_features, actions], dim=-1))
+
+
+class RewardModel(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        goal_dim: int,
+        hidden_dim: int,
+        obs_shape: tuple[int, int, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.obs_encoder = ObservationEncoder(obs_dim, hidden_dim, obs_shape)
+        self.net = nn.Sequential(
+            nn.Linear(self.obs_encoder.output_dim + action_dim + goal_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, states: torch.Tensor, actions: torch.Tensor, goals: torch.Tensor) -> torch.Tensor:
+        obs_features = self.obs_encoder(states)
+        return self.net(torch.cat([obs_features, actions, goals], dim=-1))
+
+
 class CRLAgent:
     def __init__(self, config: CRLConfig):
         self.config = config
         self.device = torch.device(config.device)
 
-        self.actor = Actor(config.obs_dim, config.goal_dim, config.action_dim, config.hidden_dim).to(self.device)
-        self.sa_encoder = MLP(config.obs_dim + config.action_dim, config.hidden_dim, config.repr_dim).to(self.device)
+        self.actor = Actor(
+            config.obs_dim,
+            config.goal_dim,
+            config.action_dim,
+            config.hidden_dim,
+            obs_shape=config.obs_shape,
+        ).to(self.device)
+        self.sa_encoder = StateActionEncoder(
+            config.obs_dim,
+            config.action_dim,
+            config.hidden_dim,
+            config.repr_dim,
+            obs_shape=config.obs_shape,
+        ).to(self.device)
         self.g_encoder = MLP(config.goal_dim, config.hidden_dim, config.repr_dim).to(self.device)
-        self.reward_head = MLP(config.obs_dim + config.action_dim + config.goal_dim, config.hidden_dim, 1).to(self.device)
+        self.reward_head = RewardModel(
+            config.obs_dim,
+            config.action_dim,
+            config.goal_dim,
+            config.hidden_dim,
+            obs_shape=config.obs_shape,
+        ).to(self.device)
 
         self.log_alpha = nn.Parameter(torch.zeros(1, device=self.device))
         self.target_entropy = config.target_entropy_scale * float(config.action_dim)
@@ -151,8 +268,7 @@ class CRLAgent:
         raise ValueError(f"Unknown contrastive loss: {loss_type}")
 
     def _encode_sa(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        sa = torch.cat([states, actions], dim=-1)
-        z = self.sa_encoder(sa)
+        z = self.sa_encoder(states, actions)
         if self.config.normalize_repr:
             z = F.normalize(z, p=2, dim=-1)
         return z
@@ -169,8 +285,7 @@ class CRLAgent:
         return self._energy(sa_z, g_z, self.config.energy_fn)
 
     def _reward_values(self, states: torch.Tensor, actions: torch.Tensor, goals: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([states, actions, goals], dim=-1)
-        return self.reward_head(x).squeeze(-1)
+        return self.reward_head(states, actions, goals).squeeze(-1)
 
     @torch.no_grad()
     def act(self, state: Any, goal: Any, deterministic: bool = False) -> Any:
