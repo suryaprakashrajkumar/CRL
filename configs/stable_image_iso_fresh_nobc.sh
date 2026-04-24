@@ -21,8 +21,9 @@ CMD=(
   --camera-name isometric
   --render-width 320
   --render-height 240
-  --image-observation-width 64
-  --image-observation-height 64
+  --image-observation-width 48
+  --image-observation-height 48
+  --image-observation-grayscale
 
   --scripted-demo-episodes 200
   --bc-pretrain-steps 0
@@ -55,7 +56,8 @@ CMD=(
   --action-scale-gripper 0.010
   --success-threshold-xy 0.04
 
-  --buffer-capacity-transitions 1000000
+  # Image observations are much larger than state observations; keep replay memory bounded.
+  --buffer-capacity-transitions 120000
   --contrastive-goal-mode future
   --her-ratio 0.35
   --her-min-goal-dist 0.02
