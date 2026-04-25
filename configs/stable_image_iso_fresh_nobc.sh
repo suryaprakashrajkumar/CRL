@@ -28,7 +28,8 @@ CMD=(
   --scripted-demo-episodes 200
   --bc-pretrain-steps 0
   --scripted-demo-max-steps 180
-  --scripted-demo-success-threshold 1.0
+  --scripted-demo-success-threshold 0.0
+  --disable-scripted-demo-oracle-assist
 
   --total-episodes 60000
   --episode-length 250
@@ -57,6 +58,7 @@ CMD=(
   --success-threshold-xy 0.04
 
   # Image observations are much larger than state observations; keep replay memory bounded.
+  --buffer-capacity-episodes 480
   --buffer-capacity-transitions 120000
   --contrastive-goal-mode future
   --her-ratio 0.35
