@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from collections import defaultdict
 from dataclasses import asdict
@@ -40,8 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bc-batch-size", type=int, default=512)
     parser.add_argument("--scripted-demo-success-threshold", type=float, default=1.0)
     parser.add_argument("--scripted-demo-max-attempts-mult", type=int, default=20)
-    parser.add_argument("--scripted-demo-oracle-assist", action="store_true", default=True)
+    parser.add_argument("--scripted-demo-oracle-assist", action="store_true", default=False)
     parser.add_argument("--disable-scripted-demo-oracle-assist", dest="scripted_demo_oracle_assist", action="store_false")
+    parser.add_argument("--allow-oracle-future-goal-leak", action="store_true", default=False)
     parser.add_argument("--post-bc-exploration-scale", type=float, default=0.2)
     parser.add_argument("--post-bc-action-noise-scale", type=float, default=0.4)
 
@@ -293,7 +295,9 @@ def save_checkpoint(
         "args": vars(args),
         "agent": agent.state_dict(),
     }
-    torch.save(payload, path)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def maybe_resume_from_checkpoint(
@@ -400,6 +404,16 @@ def run_video_eval(
 
 def main() -> None:
     args = parse_args()
+    if (
+        args.scripted_demo_episodes > 0
+        and args.scripted_demo_oracle_assist
+        and args.contrastive_goal_mode == "future"
+        and not args.allow_oracle_future_goal_leak
+    ):
+        raise RuntimeError(
+            "Oracle-assisted scripted demos leak forced future goals into future-goal CRL. "
+            "Use real scripted successes, or pass --allow-oracle-future-goal-leak only for debugging."
+        )
     if args.max_gpu_mode:
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True

@@ -109,6 +109,7 @@ class WidowXPickPlaceEnv(gym.Env):
         self._blue_site_id = self._name2id_or_raise(mujoco.mjtObj.mjOBJ_SITE, "blue_zone_site")
 
         self._ee_body_id = self._resolve_ee_body_id()
+        self._grasp_geom_ids = self._resolve_grasp_geom_ids()
 
         self._table_top_z = 0.04
         self._cube_rest_z = self._table_top_z + self.config.cube_size + 0.0005
@@ -170,6 +171,26 @@ class WidowXPickPlaceEnv(gym.Env):
                 return int(idx)
         raise KeyError("Could not find end-effector body. Expected wx250s/gripper_link or gripper_link.")
 
+    def _resolve_grasp_geom_ids(self) -> np.ndarray:
+        candidates = ["left/left_g0", "left/left_g1", "right/right_g0", "right/right_g1"]
+        ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in candidates]
+        valid = [idx for idx in ids if idx >= 0]
+        if valid:
+            return np.asarray(valid, dtype=np.int32)
+        raise KeyError("Could not find fingertip grasp geoms.")
+
+    def _grasp_position(self) -> np.ndarray:
+        return self.data.geom_xpos[self._grasp_geom_ids].mean(axis=0).copy()
+
+    def _grasp_jacobian(self) -> np.ndarray:
+        jacp_acc = np.zeros((3, self.model.nv), dtype=np.float64)
+        jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+        for geom_id in self._grasp_geom_ids:
+            jacp.fill(0.0)
+            mujoco.mj_jacGeom(self.model, self.data, jacp, None, int(geom_id))
+            jacp_acc += jacp
+        return jacp_acc / float(len(self._grasp_geom_ids))
+
     def _apply_home_pose(self) -> None:
         if self.model.nkey > 0:
             self.data.qpos[:] = self.model.key_qpos[0]
@@ -211,7 +232,7 @@ class WidowXPickPlaceEnv(gym.Env):
         qpos = self.data.qpos[self._qpos_ids].astype(np.float32)
         qvel = self.data.qvel[self._qvel_ids].astype(np.float32)
 
-        ee_pos = self.data.xpos[self._ee_body_id].astype(np.float32)
+        ee_pos = self._grasp_position().astype(np.float32)
         cube_pos = self.data.xpos[self._cube_body_id].astype(np.float32)
 
         cube_to_ee = (cube_pos - ee_pos).astype(np.float32)
@@ -275,20 +296,32 @@ class WidowXPickPlaceEnv(gym.Env):
         if not self.config.enable_grasp_assist:
             return
 
-        ee_pos = self.data.xpos[self._ee_body_id]
+        ee_pos = self._grasp_position()
         cube_pos = self.data.xpos[self._cube_body_id]
         gripper_ctrl = float(self._ctrl_target[-1])
-        ee_cube_dist = float(np.linalg.norm(ee_pos - cube_pos))
+        ee_cube_xy = float(np.linalg.norm((ee_pos - cube_pos)[:2]))
+        ee_cube_z = float(abs(ee_pos[2] - cube_pos[2]))
 
-        if (not self._cube_attached) and ee_cube_dist < self.config.grasp_distance_threshold and gripper_ctrl >= self.config.grasp_close_ctrl_threshold:
+        if (
+            (not self._cube_attached)
+            and ee_cube_xy < self.config.grasp_distance_threshold
+            and ee_cube_z < max(0.035, self.config.cube_size * 2.5)
+            and gripper_ctrl >= self.config.grasp_close_ctrl_threshold
+        ):
             self._cube_attached = True
 
         if self._cube_attached and gripper_ctrl <= self.config.grasp_release_ctrl_threshold:
+            release_pos = ee_pos.copy()
+            release_pos[2] = self._cube_rest_z
+            self.data.qpos[self._cube_qpos_adr : self._cube_qpos_adr + 3] = release_pos
+            self.data.qpos[self._cube_qpos_adr + 3 : self._cube_qpos_adr + 7] = np.array([1.0, 0.0, 0.0, 0.0])
+            dof_adr = int(self.model.jnt_dofadr[self._cube_joint_id])
+            self.data.qvel[dof_adr : dof_adr + 6] = 0.0
             self._cube_attached = False
 
         if self._cube_attached:
-            carry_offset = np.array([0.0, 0.0, -self.config.cube_size * 1.2], dtype=np.float64)
-            target_pos = ee_pos + carry_offset
+            target_pos = ee_pos.copy()
+            target_pos[2] = max(target_pos[2], self._cube_rest_z)
             self.data.qpos[self._cube_qpos_adr : self._cube_qpos_adr + 3] = target_pos
             self.data.qpos[self._cube_qpos_adr + 3 : self._cube_qpos_adr + 7] = np.array([1.0, 0.0, 0.0, 0.0])
             dof_adr = int(self.model.jnt_dofadr[self._cube_joint_id])
@@ -309,7 +342,7 @@ class WidowXPickPlaceEnv(gym.Env):
         return reward
 
     def _compute_step_reward(self) -> tuple[float, dict[str, float]]:
-        ee_pos = self.data.xpos[self._ee_body_id]
+        ee_pos = self._grasp_position()
         cube_pos = self.data.xpos[self._cube_body_id]
 
         dist_goal = float(self._distance_xy(cube_pos, self._desired_goal))
@@ -341,20 +374,20 @@ class WidowXPickPlaceEnv(gym.Env):
 
     def scripted_action(self, obs: dict[str, np.ndarray]) -> np.ndarray:
         """Generate a scripted action using Jacobian-based Cartesian tracking plus gripper logic."""
-        ee_pos = self.data.xpos[self._ee_body_id].copy()
+        ee_pos = self._grasp_position()
         cube_pos = self.data.xpos[self._cube_body_id].copy()
         goal_pos = np.asarray(obs["desired_goal"], dtype=np.float64)
 
         if self._is_success_blue_zone():
-            self._script_phase = "retreat"
+            self._script_phase = "release" if self._cube_attached else "retreat"
 
         dist_xy_to_cube = float(np.linalg.norm((ee_pos - cube_pos)[:2]))
-        dist_xyz_to_cube = float(np.linalg.norm(ee_pos - cube_pos))
+        dist_z_to_cube = float(abs(ee_pos[2] - cube_pos[2]))
         cube_lifted = bool(cube_pos[2] > self._cube_rest_z + 0.02)
 
         if self._script_phase == "approach" and dist_xy_to_cube < 0.025:
             self._script_phase = "descend"
-        if self._script_phase == "descend" and dist_xyz_to_cube < 0.04:
+        if self._script_phase == "descend" and dist_xy_to_cube < 0.025 and dist_z_to_cube < 0.03:
             self._script_phase = "close"
         if self._script_phase == "close" and (self._cube_attached or cube_lifted):
             self._script_phase = "lift"
@@ -362,13 +395,15 @@ class WidowXPickPlaceEnv(gym.Env):
             self._script_phase = "to_goal"
         if self._script_phase == "to_goal" and float(np.linalg.norm((cube_pos - goal_pos)[:2])) < 0.03:
             self._script_phase = "release"
+        if self._script_phase == "release" and (not self._cube_attached) and self._is_success_blue_zone():
+            self._script_phase = "retreat"
 
-        hover_cube = np.array([cube_pos[0], cube_pos[1], cube_pos[2] + 0.08], dtype=np.float64)
-        near_cube = np.array([cube_pos[0], cube_pos[1], cube_pos[2] + 0.02], dtype=np.float64)
-        lift_pos = np.array([cube_pos[0], cube_pos[1], self._cube_rest_z + 0.09], dtype=np.float64)
-        goal_hover = np.array([goal_pos[0], goal_pos[1], self._cube_rest_z + 0.09], dtype=np.float64)
-        goal_drop = np.array([goal_pos[0], goal_pos[1], self._cube_rest_z + 0.03], dtype=np.float64)
-        retreat_pos = np.array([goal_pos[0], goal_pos[1], self._cube_rest_z + 0.12], dtype=np.float64)
+        hover_cube = np.array([cube_pos[0], cube_pos[1], cube_pos[2] + 0.09], dtype=np.float64)
+        near_cube = np.array([cube_pos[0], cube_pos[1], cube_pos[2] + 0.005], dtype=np.float64)
+        lift_pos = np.array([cube_pos[0], cube_pos[1], self._cube_rest_z + 0.10], dtype=np.float64)
+        goal_hover = np.array([goal_pos[0], goal_pos[1], self._cube_rest_z + 0.10], dtype=np.float64)
+        goal_drop = np.array([goal_pos[0], goal_pos[1], self._cube_rest_z + 0.02], dtype=np.float64)
+        retreat_pos = np.array([ee_pos[0], ee_pos[1], self._cube_rest_z + 0.13], dtype=np.float64)
 
         grip_cmd = -1.0
         if self._script_phase == "approach":
@@ -390,8 +425,7 @@ class WidowXPickPlaceEnv(gym.Env):
         else:
             target_pos = retreat_pos
 
-        jacp = np.zeros((3, self.model.nv), dtype=np.float64)
-        mujoco.mj_jacBodyCom(self.model, self.data, jacp, None, self._ee_body_id)
+        jacp = self._grasp_jacobian()
         j_ee = jacp[:, self._arm_dof_ids]
 
         pos_err = target_pos - ee_pos

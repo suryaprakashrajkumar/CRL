@@ -27,8 +27,8 @@ CMD=(
 
   --scripted-demo-episodes 200
   --bc-pretrain-steps 0
-  --scripted-demo-max-steps 180
-  --scripted-demo-success-threshold 0.0
+  --scripted-demo-max-steps 250
+  --scripted-demo-success-threshold 1.0
   --disable-scripted-demo-oracle-assist
 
   --total-episodes 60000
