@@ -73,6 +73,18 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--repr-dim", type=int, default=64)
+    parser.add_argument(
+        "--residual-depth",
+        type=int,
+        default=0,
+        help="Total Dense layers inside residual blocks for actor and CRL critic encoders. Use 0 for shallow MLPs.",
+    )
+    parser.add_argument(
+        "--residual-block-size",
+        type=int,
+        default=4,
+        help="Dense->LayerNorm->SiLU units per residual block; the Scaling CRL paper uses 4.",
+    )
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
@@ -463,6 +475,8 @@ def main() -> None:
         action_dim=action_dim,
         hidden_dim=args.hidden_dim,
         repr_dim=args.repr_dim,
+        residual_depth=args.residual_depth,
+        residual_block_size=args.residual_block_size,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
         alpha_lr=args.alpha_lr,

@@ -38,25 +38,83 @@ class CRLConfig:
     min_log_alpha: float = -4.0
     max_log_alpha: float = 2.0
     normalize_repr: bool = True
+    residual_depth: int = 0
+    residual_block_size: int = 4
     obs_shape: tuple[int, int, int] | None = None
     device: str = "cpu"
 
 
-class MLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
+class ResidualDenseBlock(nn.Module):
+    """Four-layer residual block from Scaling CRL: (Dense, LayerNorm, SiLU) x N, then skip-add."""
+
+    def __init__(self, hidden_dim: int, block_size: int = 4) -> None:
         super().__init__()
+        if block_size < 1:
+            raise ValueError("residual_block_size must be >= 1.")
+        layers: list[nn.Module] = []
+        for _ in range(block_size):
+            layers.extend(
+                [
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.SiLU(),
+                ]
+            )
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
+class ResidualDenseStack(nn.Module):
+    def __init__(self, hidden_dim: int, residual_depth: int = 0, residual_block_size: int = 4) -> None:
+        super().__init__()
+        if residual_depth < 0:
+            raise ValueError("residual_depth must be >= 0.")
+        if residual_depth == 0:
+            self.net = nn.Identity()
+            self.num_blocks = 0
+            return
+        if residual_depth % residual_block_size != 0:
+            raise ValueError("residual_depth must be divisible by residual_block_size.")
+        self.num_blocks = residual_depth // residual_block_size
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
+            *[ResidualDenseBlock(hidden_dim, residual_block_size) for _ in range(self.num_blocks)]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        residual_depth: int = 0,
+        residual_block_size: int = 4,
+    ) -> None:
+        super().__init__()
+        self.input = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+        if residual_depth > 0:
+            self.body = ResidualDenseStack(hidden_dim, residual_depth, residual_block_size)
+        else:
+            self.body = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+            )
+        self.output = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.input(x)
+        h = self.body(h)
+        return self.output(h)
 
 
 class ObservationEncoder(nn.Module):
@@ -110,24 +168,31 @@ class Actor(nn.Module):
         action_dim: int,
         hidden_dim: int,
         obs_shape: tuple[int, int, int] | None = None,
+        residual_depth: int = 0,
+        residual_block_size: int = 4,
     ) -> None:
         super().__init__()
         self.obs_encoder = ObservationEncoder(obs_dim, hidden_dim, obs_shape)
-        self.trunk = nn.Sequential(
+        self.input = nn.Sequential(
             nn.Linear(self.obs_encoder.output_dim + goal_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
         )
+        if residual_depth > 0:
+            self.trunk = ResidualDenseStack(hidden_dim, residual_depth, residual_block_size)
+        else:
+            self.trunk = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+            )
         self.mean_head = nn.Linear(hidden_dim, action_dim)
         self.log_std_head = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, states: torch.Tensor, goals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         obs_features = self.obs_encoder(states)
         x = torch.cat([obs_features, goals], dim=-1)
-        h = self.trunk(x)
+        h = self.trunk(self.input(x))
         mean = self.mean_head(h)
 
         log_std = torch.tanh(self.log_std_head(h))
@@ -158,19 +223,24 @@ class StateActionEncoder(nn.Module):
         hidden_dim: int,
         repr_dim: int,
         obs_shape: tuple[int, int, int] | None = None,
+        residual_depth: int = 0,
+        residual_block_size: int = 4,
     ) -> None:
         super().__init__()
         self.obs_encoder = ObservationEncoder(obs_dim, hidden_dim, obs_shape)
-        self.net = nn.Sequential(
+        self.input = nn.Sequential(
             nn.Linear(self.obs_encoder.output_dim + action_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, repr_dim),
         )
+        self.body = ResidualDenseStack(hidden_dim, residual_depth, residual_block_size)
+        self.output = nn.Linear(hidden_dim, repr_dim)
 
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         obs_features = self.obs_encoder(states)
-        return self.net(torch.cat([obs_features, actions], dim=-1))
+        h = self.input(torch.cat([obs_features, actions], dim=-1))
+        h = self.body(h)
+        return self.output(h)
 
 
 class RewardModel(nn.Module):
@@ -207,6 +277,8 @@ class CRLAgent:
             config.action_dim,
             config.hidden_dim,
             obs_shape=config.obs_shape,
+            residual_depth=config.residual_depth,
+            residual_block_size=config.residual_block_size,
         ).to(self.device)
         self.sa_encoder = StateActionEncoder(
             config.obs_dim,
@@ -214,8 +286,16 @@ class CRLAgent:
             config.hidden_dim,
             config.repr_dim,
             obs_shape=config.obs_shape,
+            residual_depth=config.residual_depth,
+            residual_block_size=config.residual_block_size,
         ).to(self.device)
-        self.g_encoder = MLP(config.goal_dim, config.hidden_dim, config.repr_dim).to(self.device)
+        self.g_encoder = MLP(
+            config.goal_dim,
+            config.hidden_dim,
+            config.repr_dim,
+            residual_depth=config.residual_depth,
+            residual_block_size=config.residual_block_size,
+        ).to(self.device)
         self.reward_head = RewardModel(
             config.obs_dim,
             config.action_dim,
