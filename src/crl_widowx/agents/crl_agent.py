@@ -307,14 +307,20 @@ class CRLAgent:
         self.log_alpha = nn.Parameter(torch.zeros(1, device=self.device))
         self.target_entropy = config.target_entropy_scale * float(config.action_dim)
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=config.actor_lr)
-        self.critic_opt = torch.optim.Adam(
+        self.actor_params = list(self.actor.parameters())
+        self.critic_params = (
             list(self.sa_encoder.parameters())
             + list(self.g_encoder.parameters())
-            + list(self.reward_head.parameters()),
-            lr=config.critic_lr,
+            + list(self.reward_head.parameters())
         )
+
+        self.actor_opt = torch.optim.Adam(self.actor_params, lr=config.actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic_params, lr=config.critic_lr)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=config.alpha_lr)
+
+    def _set_critic_requires_grad(self, requires_grad: bool) -> None:
+        for param in self.critic_params:
+            param.requires_grad_(requires_grad)
 
     @staticmethod
     def _energy(x: torch.Tensor, y: torch.Tensor, fn_name: str) -> torch.Tensor:
@@ -414,17 +420,12 @@ class CRLAgent:
         self.critic_opt.zero_grad(set_to_none=True)
         critic_total.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.sa_encoder.parameters()) + list(self.g_encoder.parameters()) + list(self.reward_head.parameters()),
+            self.critic_params,
             max_norm=10.0,
         )
         self.critic_opt.step()
 
-        for p in self.sa_encoder.parameters():
-            p.requires_grad_(False)
-        for p in self.g_encoder.parameters():
-            p.requires_grad_(False)
-        for p in self.reward_head.parameters():
-            p.requires_grad_(False)
+        self._set_critic_requires_grad(False)
 
         sampled_action, log_prob, mean = self.actor.sample(states, actor_goals, deterministic=False)
         q_pi = self._q_values(states, sampled_action, actor_goals)
@@ -445,12 +446,7 @@ class CRLAgent:
 
         actor_loss = actor_sac_loss + self.config.actor_awbc_coeff * awbc_loss
         if not torch.isfinite(actor_loss):
-            for p in self.sa_encoder.parameters():
-                p.requires_grad_(True)
-            for p in self.g_encoder.parameters():
-                p.requires_grad_(True)
-            for p in self.reward_head.parameters():
-                p.requires_grad_(True)
+            self._set_critic_requires_grad(True)
             return {
                 "critic/loss": float(critic_loss.item()),
                 "critic/logsumexp_penalty": float(logsumexp_penalty.item()),
@@ -471,15 +467,10 @@ class CRLAgent:
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_(self.actor_params, max_norm=10.0)
         self.actor_opt.step()
 
-        for p in self.sa_encoder.parameters():
-            p.requires_grad_(True)
-        for p in self.g_encoder.parameters():
-            p.requires_grad_(True)
-        for p in self.reward_head.parameters():
-            p.requires_grad_(True)
+        self._set_critic_requires_grad(True)
 
         alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
         if not torch.isfinite(alpha_loss):

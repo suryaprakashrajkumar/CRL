@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 SESSION_NAME="crl_scaling_iso_nobc_d32_$(date +%Y%m%d_%H%M%S)"
 CHECKPOINT_DIR="checkpoints/${SESSION_NAME}"
 LOG_FILE="logs/${SESSION_NAME}.log"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 
 mkdir -p checkpoints logs
 
@@ -86,6 +87,10 @@ CMD=(
   --wandb-run-name "${SESSION_NAME}"
   --checkpoint-dir "${CHECKPOINT_DIR}"
 )
+
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+  CMD+=(--resume-checkpoint "$RESUME_CHECKPOINT" --resume-load-optimizers --resume-load-alpha)
+fi
 
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   tmux kill-session -t "$SESSION_NAME"
